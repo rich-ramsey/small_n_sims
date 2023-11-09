@@ -505,6 +505,7 @@ code factors (for plotting)
 ```{r}
 ## read in if necessary
 # sim_dat <- read_csv("data/sim_dat.csv")
+# sim_dat <- read_csv("data/sim_dat_2.csv")
 
 sim_dat <- 
   sim_dat %>% 
@@ -855,5 +856,18 @@ following things are the current situation:
 and thus power. Even in a case where data included 80k datapoints in total
 (N=20, rep_n = 100 plus the rest of the conditions and items), power was still 0.
 
-This seems discrepant from the power contours paper. Maybe I need to use a different
-dataset??? Original units? Or past data?
+This seems discrepant from the power contours paper. Or maybe not as discrepant as 
+I initially thought. If I plug the within and between sigma values for the 
+standardised data into the power contours app, I get N=63, K=12. If I compare that
+to my data (granted this is just the raw data and 95% CI rather than a model),
+we see that N=50, K=10 gives 97% power. So there is something different in the 
+computation between my sims and power contours. The effect of trial count seems 
+the same (e.g., low is fine and increasing it makes no difference). But the N is
+discrepant. N=50 gives 97% power in my sims, but something closer to N=90 would
+give 90% power in the power contours app.
+
+Maybe I need to use a different dataset??? Original units? Or past data? Or super
+simple data to take a closer look.
+
+I wonder if trial count is being counted in the same way? In power contours, does
+K=10 mean 10 per condition? Or per pid?
