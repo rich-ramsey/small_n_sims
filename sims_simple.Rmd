@@ -1,0 +1,961 @@
+---
+title: "sims_simple"
+author: "Rich"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+After playing with the sims.Rmd code, I figured I needed to start with a simpler
+dataset. The motivation for this script is to test how trial count and sample
+size relate to precision and power but with a simple design. e.g., two conditions
+and minimal varying effects. 
+
+So far, for the data that I used in sims.Rmd, there was basically no benefit (save
+a very small benefit in the precision of the point estimate) of increasing trial
+count above 10. It make almost no impact on power or precision (width of the 95%
+CI). That might be appropriate given the structure of the data. But it does not
+feel satisfying because what I want to build are intuitions and ways to simulate
+data with varying trial counts and sample sizes in meaningful ways.
+
+e.g., data where trial and sample size matter and where can simulate to show that 
+this is the case.
+
+Let's try data from sim1 from the power contours paper and see if we get something
+similar. 
+
+Or at least, let's try to build a multi-level model with varying intercepts
+and slopes by pid and then use that to provide the values to build a simulation
+where we can vary parameters (like N and K).
+
+## load the libraries that we will be using ## 
+
+## install ##
+
+```{r install-pkg}
+# install.packages("remotes")
+# remotes::install_github("stan-dev/cmdstanr")
+# 
+# install.packages("devtools")
+# devtools::install_github("jmgirard/standist")
+# 
+# install.packages(c("tidyverse", "RColorBrewer", "patchwork", "brms",
+#                    "tidybayes", "bayesplot", "patchwork", "future", "faux"))
+```
+
+take a snapshot of loaded packages and update the lock.file using renv
+
+```{r snapshot-renv}
+# take a snapshot and update the lock.file
+# renv::snapshot() # this is only necessary when new packages or installed or packages are updated.
+```
+
+## load ##
+
+```{r load-pkg}
+pkg <- c("cmdstanr", "standist", "tidyverse", "RColorBrewer", "patchwork", 
+         "brms", "tidybayes", "bayesplot", "future", "parallel", "faux")
+
+lapply(pkg, library, character.only = TRUE)
+```
+
+## settings ##
+
+```{r set-options}
+options(brms.backend = "cmdstanr",
+        mc.cores = parallel::detectCores(),
+        future.fork.enable = TRUE,
+        future.rng.onMisuse = "ignore") ## automatically set in RStudio
+
+supportsMulticore()
+
+detectCores()
+```
+
+## section 1 - read in past data and build a model ##
+
+## read in the data ##
+
+this is the data used in sim1 from the power contours paper
+
+```{r}
+load("data/osfstorage-archive/RTData.RData")
+```
+
+## wrangle ##
+
+```{r}
+## congruent data
+congr <- allC %>%
+  as_tibble(rownames = "pid") %>% 
+  pivot_longer(cols = -pid,
+               values_to = "rt",
+               names_to = "condition") %>% 
+  mutate(condition = "congr",
+         k = rep(1:600, times = 38)) %>% 
+  select(pid, k, condition, rt)
+head(congr)
+
+## incongruent data
+incon <- allI %>%
+  as_tibble(rownames = "pid") %>% 
+  pivot_longer(cols = -pid,
+               values_to = "rt",
+               names_to = "condition") %>% 
+  mutate(condition = "incon",
+         k = rep(1:200, times = 38)) %>% 
+  select(pid, k, condition, rt)
+head(incon)
+
+## bind together
+data <- rbind(congr, incon) # %>% 
+  # mutate(rt = rt+200) ## according to the code online 200 needs adding because rt was defined by stim offset and stim was onscreen for 200ms. I have not modelled the data with this 200 added yet.
+head(data)
+str(data)
+```
+
+## create factors ##
+
+```{r}
+data <- data %>% 
+  mutate(condition = factor(condition, 
+                            levels = c("congr", "incon")))
+head(data)
+```
+
+## quick plot ##
+
+plot settings
+
+```{r}
+## Set the amount of dodge in figures
+pd <- position_dodge(0.7)
+pd2 <- position_dodge(1)
+```
+
+violin
+
+```{r}
+ggplot(data, aes(x = condition, y = rt, fill = condition)) +
+  geom_jitter(width = 0.1, alpha = 1, colour = "darkgrey") +
+  geom_violin(alpha = 0.7, position=pd2) +
+  scale_fill_brewer(palette = "Dark2") +
+  theme_bw()
+```
+
+## power contours values ##
+
+these are the values that we want to get from the data. We of course already know
+these from the power contours paper, but it would be nice to see that we can get
+the same.
+
+```{r}
+N <- 38 # sample size
+k <- 200 # trial count (per condition??) 200 incon, 600 cong
+diff <- 51.0 # difference score in original units
+sd_s <- 42.4 # sd of the diff
+sd_w <- 151 # sd within
+sd_b <- 41 # sd between
+sd_ratio <- sd_w / sd_b
+d <- diff / sd_s
+```
+
+This means we need to calculate the difference score and the sd of the diff
+
+here we get diff (as mean_diff), sd_s and d. But keep in mind that this is an
+average difference score per pid because they are not linked on a trial-by-trial
+basis. e.g., there are just 200 cong and 600 incong trials per pid.
+
+```{r}
+# at the pid level
+data_diff_pid <- data %>%
+  group_by(pid, condition) %>% 
+  summarise(mean_rt = mean(rt)) %>% 
+  pivot_wider(id_cols = c(pid),
+              names_from = "condition",
+              values_from = "mean_rt") %>% 
+  mutate(diff = incon - congr) %>% 
+  ungroup()
+data_diff_pid
+
+# at the group level
+data_diff <- data_diff_pid %>% 
+  summarise(mean_diff = mean(diff),
+            sd_s = sd(diff),
+            d = mean_diff / sd_s)
+data_diff
+
+# assign these values in the chunk above
+# diff = 51.0
+# sd_s = 42.4
+# d = 1.20
+```
+
+now sigma_w
+
+```{r}
+# at the pid level
+sigma_w_pid <- data %>%
+  pivot_wider(id_cols = c(pid, k),
+              names_from = "condition",
+              values_from = "rt") %>%
+  group_by(pid) %>% 
+  summarise(sd_c = sd(congr),
+            sd_i = sd(incon, na.rm = TRUE),
+            all_within = sqrt(sd(congr)^2 + sd(incon, na.rm = TRUE)^2))
+sigma_w_pid
+
+# at the group level
+sigma_w <- sigma_w_pid %>% 
+  summarise(sd_c = mean(sd_c),
+            sd_i = mean(sd_i),
+            sd_w = mean(all_within))
+sigma_w
+# assign these values in the chunk above
+# sd_w = 151
+```
+
+now sigma_b 
+
+```{r}
+sigma_b <- sqrt(sd_s^2 - ((sd_w^2)/k))
+sigma_b
+
+# assign these values in the chunk above
+# sd_b = 41.03
+```
+
+ok, these values are exactly the same as the power contours paper, which is re-assuring.
+
+## build a model ##
+
+this is to estimate parameters that we will use later in our sims.
+
+## b1 - full model, original units ##
+
+# formula #
+
+```{r}
+formula = bf(rt ~ 1 + condition +
+               (1 + condition | pid))
+```
+
+# check the priors available #
+
+```{r}
+get_prior(formula,
+          data = data, family = gaussian())
+```
+
+## visualise priors ##
+
+here we would normally visualise priors of interest to make a judgment about what
+would constitute weakly informative priors. But we did this in the planning stage,
+so we'll just repeat the plots here as a reminder.
+
+intercept
+
+```{r}
+visualize("normal(500, 25)", "normal(500, 50)", "normal(500, 100)", 
+          "normal(500, 150)", "normal(500, 200)",
+          xlim = c(0, 1000))
+```
+
+500, 150 for the intercept provides good coverage for what we might expect
+for the intercept or mean RT.
+
+sigma
+
+```{r}
+visualize("normal(0, 25)", "normal(0, 50)", "normal(0, 100)", "normal(0, 150)",
+          xlim = c(-300, 300))
+```
+
+0, 150 for sigma provides good coverage of what we might expect (of course, it has
+to be positive, so brms will set lower bound to zero anyway)
+
+b
+
+```{r}
+visualize("normal(0, 25)", "normal(0, 50)", "normal(0, 100)",
+          xlim = c(-300, 300))
+```
+
+0, 50 for b looks good as it minimises the likelihood of effects over 100ms, which
+seems reasonable for this kind of RT data.
+
+## set priors ##
+
+original units
+
+```{r}
+priors <- c(
+  set_prior("normal(500, 150)", class = "Intercept"),
+  set_prior("normal(0, 50)", class = "b"),
+  set_prior("normal(0, 150)", class = "sd"),
+  set_prior("normal(0, 150)", class = "sigma"),
+  set_prior("lkj(2)", class = "cor")
+)
+```
+
+# run the model #
+
+```{r}
+plan(multicore)
+b1 <- brm(formula = formula,
+        data = data, family = gaussian(),
+        prior = priors,
+        iter = 2000, warmup = 1000, cores = 8, chains = 4,
+        save_pars = save_pars(all=TRUE),
+        seed = 123,
+        file = "models/rt/b1")
+summary(b1)
+```
+
+this looks good. No complaints and a difference score of 49.65 ms, which is very
+close to that estimated in the power contours paper (but keep in mind they used
+a t-test I think, so it is not an identical analysis).
+
+## take a look ##
+
+chains
+
+```{r}
+plot(b1)
+```
+
+pp check
+
+```{r}
+pp_b1 <- pp_check(b1, ndraws = 100, type = "dens_overlay_grouped",
+                    group = "condition")
+pp_b1
+```
+
+ok, so this is a bit off, but that's to be expected since we used a gaussian rather than a distribution that is well suited to modelling rt data. We did this
+just so the model runs faster.
+
+## section 2 - simulate some data ##
+
+now simulate some data based on the parameters estimated from the model.
+
+The below simulation does not have items to vary by, just as a reminder. The focus
+here is to try to get results from our own sims that look like the power contours
+app, but which use the approach to model building that we use i.e., multi-level
+regression models. So there is a compromise between direct copying of their type 
+of analysis and fully varying effects structures (with items varying also). 
+
+```{r}
+# make it reproducible
+set.seed(1)
+
+# define parameters
+subj_n = 25  # number of subjects
+rep_n = 100 # number of trial repeats per condition
+b0 = 300      # intercept
+b1 = 50      # fixed effect of condition
+u0s_sd = 55   # random intercept SD for subjects
+u1s_sd = 45   # random b1 slope SD for subjects
+r01s = -0.25   # correlation between random effects 0 and 1 for subjects
+sigma_sd = 100 # error SD
+
+# data_s (the s stands for simple)
+# set up data structure
+data_s <- add_random(subj = subj_n, rep = rep_n) %>%
+  # add and recode categorical variables
+  add_within("subj", condition = c("congr", "incon")) %>%
+  add_contrast("condition", "anova", add_cols = TRUE, colnames = "cond") %>%
+  # add random effects 
+  add_ranef("subj", u0s = u0s_sd, u1s = u1s_sd, .cors = r01s) %>%
+  add_ranef(sigma = sigma_sd) %>%
+  # calculate DV
+  mutate(rt = b0 + u0s + (b1 + u1s) * cond + sigma)
+
+head(data_s)
+str(data_s)
+summary(data_s)
+
+# save initial data
+# write_csv(data_s, "data/simple/data_s.csv")
+```
+
+density plot
+
+```{r}
+ggplot(data_s, aes(x=rt, fill=condition)) +
+   geom_density(alpha = 0.3, colour = "darkgrey") +
+   scale_fill_brewer(palette = "Dark2")+
+   theme_bw()+
+   theme(panel.grid = element_blank()) +
+   theme(legend.position = "none") +
+   ggtitle("rt by condition")
+# ggsave ("figures/density.jpeg")
+```
+
+## Can we calculate relevant values to plug into the power contours app? ##
+
+see Baker et al., page 298 for the RT example.
+
+Let's try to do the same with our simulated data, which was based on the original 
+data.
+
+this is what we need at the end
+
+```{r}
+N <- 25 # sample size
+k <- 100 # trial count (per condition??)
+# diff <- 48.7 # difference score in original units
+# sd_s <- 71.6 # sd of the diff
+# sd_w <- 103 # sd within
+# sd_b <- 71.1 # sd between
+# sd_ratio <- sd_w / sd_b
+# d <- diff / sd_s
+```
+
+This means we need to calculate the difference score and the sd of the diff
+
+here we get diff (as mean_diff), sd_s and d
+
+```{r}
+# at the pid level
+data_diff_pid <- data_s %>%
+  group_by(subj, condition) %>% 
+  summarise(mean_rt = mean(rt)) %>% 
+  pivot_wider(id_cols = c(subj),
+              names_from = "condition",
+              values_from = "mean_rt") %>% 
+  mutate(diff = incon - congr) %>% 
+  ungroup()
+data_diff_pid
+
+# at the group level
+data_diff <- data_diff_pid %>% 
+  summarise(mean_diff = mean(diff),
+            sd_s = sd(diff),
+            d = mean_diff / sd_s)
+data_diff
+
+# assign these values in the chunk above
+diff = 55.7
+sd_s = 44.9
+d = 1.24
+```
+
+now sigma_w
+
+```{r}
+# at the pid level
+sigma_w_pid <- data_s %>%
+  pivot_wider(id_cols = c(subj, rep),
+              names_from = "condition",
+              values_from = "rt") %>%
+  group_by(subj) %>% 
+  summarise(sd_c = sd(congr),
+            sd_i = sd(incon),
+            all_within = sqrt(sd(congr)^2 + sd(incon)^2))
+sigma_w_pid
+
+# at the group level
+sigma_w <- sigma_w_pid %>% 
+  summarise(sd_c = mean(sd_c),
+            sd_i = mean(sd_i),
+            sd_w = mean(all_within))
+sigma_w
+
+# assign these values in the chunk above
+sd_w = 145
+```
+
+now sigma_b 
+
+```{r}
+sigma_b <- sqrt(sd_s^2 - ((sd_w^2)/k))
+sigma_b
+
+# assign these values in the chunk above
+sd_b = 39.8
+```
+
+check values and calculate others as necessary
+
+```{r}
+N
+k
+diff
+sd_s
+sd_w
+sd_b
+sd_ratio <- sd_w / sd_b
+sd_ratio
+d 
+```
+
+with these values, power contours gives us these values as optimal points for 
+80% power (of course, we might want more than 80% in reality)
+
+at 0.05: N=7, K=58.
+at 0.005: N=15, K=22.
+at 0.001: N=17, K=38.
+
+for 90% power, in most cases it means adding on a handful of maybe 5 pts 
+approximately. More trials are not doing it.
+
+
+## simulate data and vary N and K ##
+
+just a quick test
+
+## create a function to simulate multiple datasets ##
+
+```{r}
+sim <- function(subj_n = 25, rep_n = 100,  # these can be changed when calling the function
+                b0 = 500, b1 = 25,         # fixed effects 
+                u0s_sd = 55,   # random intercepts subj 
+                u1s_sd = 45,   # random slope subj 
+                r01s = -0.25,   # cor
+                sigma_sd = 100,           # error term
+                ... # helps the function work with pmap() below
+                ) {
+
+  # set up data structure
+  data <- add_random(subj = subj_n, rep = rep_n) %>%
+  # add and recode categorical variables
+  add_within("subj", condition = c("congr", "incon")) %>%
+  add_contrast("condition", "anova", add_cols = TRUE, colnames = "cond") %>%
+  # add random effects 
+  add_ranef("subj", u0s = u0s_sd, u1s = u1s_sd, .cors = r01s) %>%
+  add_ranef(sigma = sigma_sd) %>%
+  # calculate DV
+  mutate(rt = b0 + u0s + (b1 + u1s) * cond + sigma)
+  
+  # glimpse(data) # only use this when testing the code
+}
+
+```
+
+Here’s a quick example of how our function works. You can change these parameters
+and create some different data.
+
+```{r}
+sim(subj_n = 25, rep_n = 10, b0 = 400, b1 = 75) # if you uncomment glimpse above,
+# it will let you glimpse the data that's generated. this is useful for checking / testing code purposes.
+```
+
+## run the simulations and iterate through exps and variables ##
+
+Here we just run 100 replicates because this is a demo. For the real thing, 
+something more like 1000 replicates would be more appropriate.
+
+## run sims and keep the data and model objects in the output ##
+
+this version keeps all the data and models (but sucks up memory), so it is mainly
+good for testing the code and checking the output rather than the real thing.
+
+Here, for example, I use it to test the code with 2 exp sims.
+
+To start with just simulate data and don't build models. Just get a sense of 
+the descriptive statistics.
+
+```{r}
+plan(multicore)
+x <- crossing(
+  exp = 1:100, # number of experiment replicates
+  subj_n = c(10, 20, 50), # range of subject N
+  rep_n = c(10, 20, 50, 100, 200)
+) %>%
+  mutate(d = pmap(., sim)) # %>%
+  #mutate(fit = map2(d, exp, ~update(fit, newdata = .x, seed = .y)))
+```
+
+let's take a look
+
+```{r}
+head(x)
+tail(x)
+```
+
+unnest to expand the data.
+
+```{r}
+sim_dat <-
+  x %>% 
+  unnest(d)
+head(sim_dat)
+
+# write_csv(sim_dat, "data/simple/sim_dat.csv") # b1=50ms, 4 k categs
+write_csv(sim_dat, "data/simple/sim_dat_2.csv") # b1=25ms, 5 k categs
+```
+
+## plot ##
+
+code factors (for plotting)
+
+```{r}
+## read in if necessary
+# sim_dat <- read_csv("data/simple/sim_dat.csv")
+# sim_dat <- read_csv("data/simple/sim_dat_2.csv")
+
+sim_dat <- 
+  sim_dat %>% 
+  mutate(exp = factor(exp),
+         subj_n = factor(subj_n),
+         rep_n = factor(rep_n),
+         condition = factor(condition, 
+                            levels = c("congr", "incon")))
+head(sim_dat)
+```
+
+and plot
+
+data 
+
+```{r}
+ggplot(sim_dat, aes(x=rt, fill=condition)) +
+   geom_density(alpha = 0.5, colour = "darkgrey") +
+   scale_fill_brewer(palette = "Dark2")+
+   theme_bw()+
+   theme(panel.grid = element_blank()) +
+   theme(legend.position = "bottom") +
+   ggtitle("rt by condition, rep_n and N") +
+   facet_grid(fct_rev(subj_n)~rep_n)
+
+ggsave ("figures/simple2/rt_density.jpeg",
+        width = 6, height = 6)
+```
+
+calculate a difference score (per pid, as this cannot be done at the trial level, 
+since there are no items etc. to link by just trials of congr and incon)
+
+this functions as summary data at the pid level
+
+```{r}
+sim_diff <- sim_dat %>% 
+  pivot_wider(id_cols = c(exp, subj_n, rep_n, subj, rep),
+              names_from = "condition",
+              values_from = "rt") %>%
+  group_by(exp, subj_n, rep_n, subj) %>% 
+  summarise(mean_congr = mean(congr),
+            mean_incon = mean(incon),
+            sd_congr = sd(congr),
+            sd_incon = sd(incon),
+            diff = mean_incon - mean_congr)
+head(sim_diff)
+```
+
+create summary data at the group level
+
+at the group level
+
+```{r}
+summary_diff <- sim_diff %>% 
+  group_by(exp, subj_n, rep_n) %>% 
+  summarise(mean_diff = mean(diff),
+            sd = sd(diff),
+            n = length(unique(subj)), # n here is the total subjs
+            sem = (sd/sqrt(length(unique(subj)))),
+            ci = sem*1.96)
+head(summary_diff)
+```
+
+quick plot with pid data
+
+plot settings
+
+```{r}
+## Set the amount of dodge in figures
+pd <- position_dodge(0.7)
+pd2 <- position_dodge(1)
+```
+
+violin
+
+```{r}
+ggplot(sim_diff, 
+               aes(x = rep_n, y = diff, fill = rep_n)) +
+  geom_jitter(width = 0.1, alpha = 1, colour = "darkgrey") +
+  geom_violin(alpha = 0.7, position=pd2) +
+  scale_fill_brewer(palette = "Dark2") +
+  theme_bw() +
+  facet_wrap(~subj_n) 
+```
+
+density
+
+```{r}
+p_dens <- ggplot(summary_diff, aes(x=mean_diff, fill=rep_n)) +
+   geom_density(alpha = 0.7, colour = "darkgrey") +
+   scale_fill_brewer(palette = "Dark2")+
+   theme_bw()+
+   # theme(panel.grid = element_blank()) +
+   theme(legend.position = "none") +
+   ggtitle("difference score by condition, rep_n and N") +
+   facet_grid(fct_rev(subj_n)~rep_n)
+p_dens
+
+ggsave ("figures/simple2/diff_dens.jpeg",
+        width = 6, height = 6)
+```
+
+histogram
+
+```{r}
+ggplot(summary_diff, aes(x=mean_diff, fill=rep_n, colour = rep_n)) +
+   geom_histogram(binwidth = 5, position = 'identity', alpha = 0.5) +
+   geom_rug(linewidth = 1/6) +
+   scale_fill_brewer(palette = "Dark2",
+                     breaks=c('10', '20', '50', '100', '200')) +
+   scale_colour_brewer(palette = "Dark2",
+                       breaks="none") +
+   theme_bw() +
+   theme(legend.position = "bottom") + 
+   # scale_x_continuous(breaks = seq(0.4, 1.1, 0.1)) +
+   ggtitle("difference score by rep_n and N") +
+   facet_wrap(~subj_n)
+
+# switch the arrangement between subj_n and rep_n
+ggplot(summary_diff, aes(x=mean_diff, fill = subj_n, colour = subj_n)) +
+   geom_histogram(binwidth = 2, position = 'identity', alpha = 0.5) +
+   geom_rug(linewidth = 1/6) +
+   scale_fill_brewer(palette = "Dark2",
+                     breaks=c('10', '20', '50')) +
+   scale_colour_brewer(palette = "Dark2",
+                       breaks="none") +
+   theme_bw() +
+   theme(legend.position = "bottom") + 
+   # scale_x_continuous(breaks = seq(0.4, 1.1, 0.1)) +
+   ggtitle("difference score by rep_n and N") +
+   facet_wrap(~rep_n, ncol = 1)
+
+# facet_grid
+p_hist <- ggplot(summary_diff, aes(x=mean_diff, fill=rep_n, colour = rep_n)) +
+   geom_histogram(binwidth = 2, alpha = 0.7) +
+   geom_rug(linewidth = 1/6) +
+   scale_fill_brewer(palette = "Dark2",
+                     breaks=c('10', '20', '50', '100', '200')) +
+   scale_colour_brewer(palette = "Dark2",
+                       breaks="none") +
+   theme_bw() +
+   theme(legend.position = "none") + 
+   # scale_x_continuous(breaks = seq(0.4, 1.1, 0.1)) +
+   ggtitle("difference score by rep_n and N") +
+   facet_grid(fct_rev(subj_n)~rep_n)
+p_hist
+
+ggsave ("figures/simple2/diff_hist.jpeg",
+        width = 6, height = 6)
+```
+
+## calculate widths ##
+
+widths = ci*2 in this case?? That is, the full width (or both arms).
+
+```{r}
+summary_diff <- summary_diff %>% 
+  mutate(width = ci*2)
+summary_diff
+```
+
+plot widths
+
+```{r}
+## separate panels
+p_width <- ggplot(summary_diff, aes(x=width, fill=rep_n, colour = rep_n)) +
+   geom_histogram(binwidth = 2, alpha = 0.7) +
+   geom_rug(linewidth = 1/6) +
+   scale_fill_brewer(palette = "Dark2",
+                     breaks=c('10', '20', '50', '100')) +
+   scale_colour_brewer(palette = "Dark2",
+                       breaks="none") +
+   theme_bw() +
+   theme(legend.position = "none") + 
+   # scale_x_continuous(breaks = seq(0.4, 1.1, 0.1)) +
+   ggtitle("difference score by rep_n and N") +
+   facet_grid(fct_rev(subj_n)~rep_n)
+p_width
+
+# ggsave ("figures/width_hist.jpeg",
+#         width = 6, height = 6)
+
+p_width <- ggplot(summary_diff, aes(x=width, fill=subj_n, colour = subj_n)) +
+   geom_histogram(binwidth = 2, alpha = 0.7) +
+   geom_rug(linewidth = 1/6) +
+   scale_fill_brewer(palette = "Dark2",
+                     breaks=c('50', '20', '10')) +
+   scale_colour_brewer(palette = "Dark2",
+                       breaks="none") +
+   theme_bw() +
+   theme(legend.position = "bottom") + 
+   # scale_x_continuous(breaks = seq(0.7, 2, 0.1)) +
+   ggtitle("95% CI width by rep_n and N") +
+   facet_wrap(~rep_n, ncol = 1)
+p_width
+
+ggsave ("figures/simple2/width_hist.jpeg",
+        width = 6, height = 8)
+```
+
+calculate avg width
+
+```{r}
+summary_diff %>%
+  group_by(subj_n, rep_n) %>%
+  summarise(avg_width = mean(width))
+
+# sim_data
+#   subj_n rep_n avg_width
+#    <fct>  <fct>     <dbl>
+#  1 10     10         76.9
+#  2 10     20         69.4
+#  3 10     50         57.4
+#  4 10     100        57.1
+#  5 20     10         54.9
+#  6 20     20         48.4
+#  7 20     50         43.3
+#  8 20     100        39.8
+#  9 50     10         34.5
+# 10 50     20         30.2
+# 11 50     50         26.9
+# 12 50     100        25.6
+
+# sim_data_2
+#   subj_n rep_n avg_width
+#    <fct>  <fct>     <dbl>
+#  1 10     10         77.4
+#  2 10     20         66.4
+#  3 10     50         59.5
+#  4 10     100        58.3
+#  5 10     200        56.2
+#  6 20     10         54.7
+#  7 20     20         48.8
+#  8 20     50         42.1
+#  9 20     100        39.4
+# 10 20     200        41.0
+# 11 50     10         35.4
+# 12 50     20         30.2
+# 13 50     50         27.0
+# 14 50     100        26.1
+# 15 50     200        25.8
+```
+
+
+## calculate and plot power ##
+
+calculate power i.e., % Q2.5 > 0
+
+```{r}
+power <- summary_diff %>% 
+  group_by(subj_n, rep_n) %>%
+  mutate(Q2.5 = mean_diff - ci,
+         check = ifelse(Q2.5 > 0, 1, 0)) %>% 
+  summarise(power = mean(check))
+power
+```
+
+plot power
+
+```{r}
+p_power <- ggplot(power, aes(rep_n, subj_n, fill = power)) +
+  geom_tile() +
+  geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 10) +
+  scale_fill_viridis_c(limits = c(0, 1))
+p_power
+
+ggsave ("figures/simple2/power.jpeg",
+        width = 6, height = 6)
+```
+
+## plot difference scores and include power as a text label ##
+
+wrangle
+
+```{r}
+plot_diffs <- summary_diff %>%
+  mutate(Q2.5 = mean_diff - ci,
+         Q97.5 = mean_diff + ci,
+         below_zero = if_else(Q2.5 < 0, "yes", "no"), 
+         below_zero = factor(below_zero, levels = c("no", "yes"))) %>% 
+  inner_join(power, by = c("subj_n", "rep_n")) %>% 
+  mutate(power = round(power * 100, 0))
+head(plot_diffs)
+```
+
+plot
+
+```{r}
+p_diffs <- plot_diffs %>%
+  ggplot(aes(x = exp, y = mean_diff, ymin = Q2.5, ymax = Q97.5)) +
+  geom_pointrange(fatten = 1/2, aes(colour=below_zero)) +
+  geom_hline(yintercept = 0, colour = "red") +
+  geom_hline(yintercept = 50, colour = "blue") + # this would add a line at b1 - the target effect size
+  scale_colour_manual(values=c("darkgrey","black")) +
+  geom_text(aes(x=50, y=-30,
+                label = sprintf("%.f%s", power, "% power")), color = "darkgrey", size = 4) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  labs(x = "sim # (i.e., simulation index)",
+       y = "difference score (ms)") +
+  scale_x_discrete(breaks = NULL) +
+  facet_grid(fct_rev(factor(subj_n)) ~ rep_n) 
+p_diffs
+
+ggsave ("figures/simple2/diffs.jpeg",
+        width = 6, height = 6)
+```
+
+ok, so both sims (simple and simple2) look sensible to me on first glance. Let's compare to power contours.
+
+sim1 (simple) - b1 = 50ms, 4 K categories:
+
+And it looks like a good fit with power contours using our single simulated
+dataset, which the sims were based on. e.g., 
+
+N=9, K=32 gives 80% power in power contours (for a mean difference of 50ms).
+
+And from our sims
+
+N=10, K=20 gives 78% power.
+
+They are pretty similar then.
+
+Based on our sims, to get towards 90% power, you want 50 or more trials (even with
+N=10). With N=20, all Ks produce 95% power or higher.
+
+Given that this kind of design would have fast trials, it would make sense to have
+at least 50 trials or more per pid and probably N=20. However, this is a very simple design
+and it has a large effect size, which may be reasonable in some domains (e.g., motor control,
+basic attention manipulations), but not others, such as cog or social psych.
+
+But the point here is just to demonstrate the principle of estimating variance 
+across trial and across pids and then simulating across N and K.
+
+
+Let's take a look at sim2 with power contours...
+
+sim2 (simple2) - b1 = 25ms, 5 K categories:
+
+N=30, K=32 gives 80% power in power contours.
+
+And from our sims
+
+N=20 at all Ks gives <80%.
+
+N=50 k >=20 gives 95% power.
+
+So based on this second simulation, it would make sense to simulate again, but
+pick Ns of 25, 30 and 35. So that we could find an efficient use of pts. So far
+all we would know is 20 is not enough and 50 is enough.
+
+What we also now know is that doubling K from 100 to 200 does not help with this particular
+kind of data and design. So it seems we have reached the straight part of the 
+power contour where there is barely any gain in power as K increases.
+
+Of course, there are many other designs, which would have more conditions or bins
+across time, so we may need 100 trials per bin or condition, so that would amount to
+a lot more trials overall than this simple design. But again running these sims
+has been informative to find a balance between K and N and to see how much power 
+that produces. 
