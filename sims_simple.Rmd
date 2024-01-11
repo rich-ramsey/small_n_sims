@@ -18,7 +18,7 @@ and minimal varying effects.
 
 So far, for the data that I used in sims.Rmd, there was basically no benefit (save
 a very small benefit in the precision of the point estimate) of increasing trial
-count above 10. It make almost no impact on power or precision (width of the 95%
+count above 10. It made almost no impact on power or precision (width of the 95%
 CI). That might be appropriate given the structure of the data. But it does not
 feel satisfying because what I want to build are intuitions and ways to simulate
 data with varying trial counts and sample sizes in meaningful ways.
